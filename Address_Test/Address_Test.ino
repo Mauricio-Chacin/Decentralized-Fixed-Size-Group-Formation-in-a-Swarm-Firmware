@@ -2,6 +2,8 @@
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
 #include <Wire.h>
+#include <Preferences.h>
+#include <esp_system.h>
 #include "HWCDC.h"
 #include <NimBLEDevice.h>
 #include <cstring>
@@ -9,7 +11,7 @@
 
 // ==========================================
 // DECENTRALIZED FIXED-SIZE GROUP FORMATION IN A SWARM
-// WAVESHARE WATCH - BLE CLIENT + 4 STATUS SCREENS
+// WAVESHARE WATCH - BLE CLIENT + 5 STATUS SCREENS
 // ==========================================
 
 HWCDC USBSerial;
@@ -59,6 +61,8 @@ std::string peerAddr = "";
 // DISPLAY HELPERS
 // ==========================================
 
+constexpr uint8_t TOTAL_SCREENS = 5;
+
 // Progress bar geometry (set by showStartingBleScreen)
 int barX, barY, barW, barH;
 
@@ -73,12 +77,12 @@ void centerText(const char *s, int y, uint8_t size, uint16_t color) {
   gfx->print(s);
 }
 
-// Clear screen and draw a small "n/4" step indicator at the top
+// Clear screen and draw a small "n/5" step indicator at the top
 void newScreen(uint8_t n) {
   gfx->fillScreen(COLOR_BLACK);
   gfx->setTextWrap(false);
   char buf[8];
-  snprintf(buf, sizeof(buf), "%u/4", n);
+  snprintf(buf, sizeof(buf), "%u/%u", n, (unsigned)TOTAL_SCREENS);
   centerText(buf, 30, 2, COLOR_DARKGREY);
 }
 
@@ -100,7 +104,72 @@ void showErrorScreen(const char *msg) {
 }
 
 // ==========================================
-// THE 4 SCREENS
+// PERSISTENT 24-BIT AGENT ADDRESS (like a MAC for the swarm)
+// Stored in NVS flash: created on first boot, only read afterwards.
+// ==========================================
+constexpr uint32_t ADDR_MASK = 0xFFFFFF;
+
+enum AddrSource {
+  ADDR_LOADED,       // read back from flash (normal boot)
+  ADDR_NEW,          // first boot: generated and saved
+  ADDR_REGENERATED,  // flash entry was corrupt: new one generated and saved
+  ADDR_SAVE_FAILED   // could not verify the write
+};
+
+uint32_t agentAddr = 0;
+AddrSource addrSource = ADDR_NEW;
+
+bool validAddress(uint32_t a) {
+  // 0x000000 and 0xFFFFFF are reserved (e.g. "none" / "broadcast")
+  return a != 0x000000 && a != ADDR_MASK;
+}
+
+uint32_t generateAddress() {
+  // Hardware RNG mixed with this chip's unique eFuse MAC, so two chips
+  // never start from the same seed even if the RNG has weak entropy this early.
+  uint64_t mac = ESP.getEfuseMac();
+  uint32_t macMix = (uint32_t)mac ^ (uint32_t)(mac >> 24);
+  uint32_t a;
+  do {
+    a = (esp_random() ^ macMix) & ADDR_MASK;
+    macMix = macMix * 1664525u + 1013904223u;  // vary the mix if we must retry
+  } while (!validAddress(a));
+  return a;
+}
+
+// Save the address plus its inverted copy, then read both back to verify
+bool saveAddress(Preferences &prefs, uint32_t a) {
+  uint32_t chk = (~a) & ADDR_MASK;
+  prefs.putUInt("addr", a);
+  prefs.putUInt("addr_chk", chk);
+  return prefs.getUInt("addr", 0) == a && prefs.getUInt("addr_chk", 0) == chk;
+}
+
+void loadOrCreateAddress() {
+  Preferences prefs;
+  prefs.begin("swarm", false);  // read/write namespace
+
+  if (prefs.isKey("addr") && prefs.isKey("addr_chk")) {
+    uint32_t a = prefs.getUInt("addr", 0);
+    uint32_t c = prefs.getUInt("addr_chk", 0);
+    if (a <= ADDR_MASK && validAddress(a) && c == ((~a) & ADDR_MASK)) {
+      agentAddr = a;
+      addrSource = ADDR_LOADED;
+      prefs.end();
+      return;
+    }
+    addrSource = ADDR_REGENERATED;  // stored value failed its check
+  } else {
+    addrSource = ADDR_NEW;          // first boot
+  }
+
+  agentAddr = generateAddress();
+  if (!saveAddress(prefs, agentAddr)) addrSource = ADDR_SAVE_FAILED;
+  prefs.end();
+}
+
+// ==========================================
+// THE 5 SCREENS
 // ==========================================
 
 // Screen 1: project title
@@ -115,9 +184,35 @@ void showTitleScreen() {
   centerText("Project 1", h - 70, 2, COLOR_WHITE);
 }
 
-// Screen 2: starting BLE (progress bar is driven by real BLE steps)
-void showStartingBleScreen() {
+// Screen 2: persistent 24-bit agent address (R&D support screen)
+void showAddressScreen() {
   newScreen(2);
+  int h = gfx->height();
+
+  char big[12], small[24];
+  snprintf(big, sizeof(big), "%02X:%02X:%02X",
+           (unsigned)((agentAddr >> 16) & 0xFF),
+           (unsigned)((agentAddr >> 8) & 0xFF),
+           (unsigned)(agentAddr & 0xFF));
+  snprintf(small, sizeof(small), "0x%06lX  (%lu)",
+           (unsigned long)agentAddr, (unsigned long)agentAddr);
+
+  centerText("AGENT ADDRESS", h / 2 - 90, 3, COLOR_MAGENTA);
+  centerText(big,   h / 2 - 40, 5, COLOR_WHITE);
+  centerText(small, h / 2 + 20, 2, COLOR_LIGHTGREY);
+  centerText("24-bit, stored in flash", h / 2 + 55, 2, COLOR_DARKGREY);
+
+  switch (addrSource) {
+    case ADDR_LOADED:       showStatus("Loaded from flash", COLOR_GREEN); break;
+    case ADDR_NEW:          showStatus("First boot: new address saved", COLOR_YELLOW); break;
+    case ADDR_REGENERATED:  showStatus("Flash corrupt: new address", COLOR_ORANGE); break;
+    case ADDR_SAVE_FAILED:  showStatus("SAVE FAILED - not persistent", COLOR_RED); break;
+  }
+}
+
+// Screen 3: starting BLE (progress bar is driven by real BLE steps)
+void showStartingBleScreen() {
+  newScreen(3);
   int w = gfx->width(), h = gfx->height();
   centerText("Starting BLE...", h / 2 - 40, 3, COLOR_YELLOW);
 
@@ -145,9 +240,9 @@ void drawScanTick(int tick) {
   gfx->fillRect(barX + 2 + range * step / 20, barY + 2, seg, barH - 4, COLOR_YELLOW);
 }
 
-// Screen 3: another BLE device acknowledged
+// Screen 4: another BLE device acknowledged
 void showDeviceFoundScreen(const char *name, const char *addr) {
-  newScreen(3);
+  newScreen(4);
   int h = gfx->height();
   centerText("BLE Device", h / 2 - 80, 3, COLOR_GREEN);
   centerText("Found!",     h / 2 - 40, 3, COLOR_GREEN);
@@ -155,9 +250,9 @@ void showDeviceFoundScreen(const char *name, const char *addr) {
   centerText(addr,         h / 2 + 50, 2, COLOR_LIGHTGREY);
 }
 
-// Screen 4a: payload sent from watch to the other ESP
+// Screen 5a: payload sent from watch to the other ESP
 void showSentScreen() {
-  newScreen(4);
+  newScreen(5);
   int h = gfx->height();
   char row[27];
   memcpy(row, txPayload, 26);
@@ -168,9 +263,9 @@ void showSentScreen() {
   showStatus("Waiting for reply...", COLOR_DARKGREY);
 }
 
-// Screen 4b: payload returned from the other ESP
+// Screen 5b: payload returned from the other ESP
 void showReturnedScreen(bool valid, uint32_t roundTripMs) {
-  newScreen(4);
+  newScreen(5);
   centerText("SENT", 70, 3, COLOR_ORANGE);
   centerText("RETURNED", 115, 4, valid ? COLOR_GREEN : COLOR_RED);
 
@@ -257,13 +352,24 @@ void setup() {
   }
   //gfx->setBrightness(200);  // remove if your Arduino_GFX version lacks it
 
+  // Read (or create on first boot) the persistent 24-bit agent address
+  loadOrCreateAddress();
+  USBSerial.printf("Agent address: 0x%06lX (%s)\n", (unsigned long)agentAddr,
+    addrSource == ADDR_LOADED ? "loaded" :
+    addrSource == ADDR_NEW ? "new, saved" :
+    addrSource == ADDR_REGENERATED ? "regenerated" : "SAVE FAILED");
+
   preparePayload();
 
   // ---- Screen 1: title ----
   showTitleScreen();
   delay(3000);
 
-  // ---- Screen 2: starting BLE ----
+  // ---- Screen 2: agent address ----
+  showAddressScreen();
+  delay(4000);
+
+  // ---- Screen 3: starting BLE ----
   showStartingBleScreen();
   drawProgress(10);
 
@@ -290,7 +396,7 @@ void setup() {
   USBSerial.println("Target ESP32 found.");
   delay(300);
 
-  // ---- Screen 3: device found ----
+  // ---- Screen 4: device found ----
   showDeviceFoundScreen(peerName.empty() ? "(no name)" : peerName.c_str(),
                         peerAddr.c_str());
   showStatus("Connecting...", COLOR_YELLOW);
@@ -362,7 +468,7 @@ void setup() {
   USBSerial.println("Connection established");
   delay(1200);
 
-  // ---- Screen 4: sent ----
+  // ---- Screen 5: sent ----
   showSentScreen();
   USBSerial.println("Sending 78-byte payload...");
 
@@ -388,7 +494,7 @@ void setup() {
     return;
   }
 
-  // ---- Screen 4: returned ----
+  // ---- Screen 5: returned ----
   bool valid = (rxLength == PAYLOAD_SIZE) &&
                (memcmp(txPayload, rxPayload, PAYLOAD_SIZE) == 0);
   showReturnedScreen(valid, echoTimeMs - t0);
